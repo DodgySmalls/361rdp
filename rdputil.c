@@ -4,17 +4,20 @@
 
 typedef enum {SYN, ACK, DAT, FIN, RST, INV} packet_intent;
 
-typedef struct {packet_intent intent, 
-				uint32_t seqno, 
-				uint32_t ackno, 
-				uint32_t datlen, 
-				uint32_t winlen} RDP_header;
+typedef struct {packet_intent intent;
+				uint32_t seqno;
+				uint32_t ackno;
+				uint32_t datlen; 
+				uint32_t winlen;
+			   } RDP_header;
 
-typedef struct {RDP_header header, 
-				void * payload} RDP_packet;
+typedef struct {RDP_header header;
+				void * payload;
+			   } RDP_packet;
 
-//                           magic         _type_          _seqno_      _ackno_     _datalen_   _windowlen_
-#define RDP_REGEX_LITERAL "^RDP361 \\([A-Z][A-Z][A-Z]\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\)"
+//                           magic      _type_             _seqno_      _ackno_     _datalen_    _windowlen_
+#define RDP_REGEX_LITERAL "^RDP361 \\([a-zA-Z][a-zA-Z][a-zA-Z]\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\)"
+#define RDP_NUMGROUPS 5 //const number of groups in the above regex, so we just define it manually rather than searching for it iteratively
 
 void * verifyMemory(void *);
 void printError(char *);
@@ -53,28 +56,32 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
 	//we zero the packet to ensure that if the match fails no garbage data remains
 	memset(r, 0, sizeof(RDP_packet));
 
+	if(regcomp(&RDP_regex, RDP_REGEX_LITERAL, 0)) {
+		printError("rdputil : Regex failed to compile.");
+	}
+
 	regex_outcome = regexec(&RDP_regex, s, RDP_regex.re_nsub+1, groups, 0);
     if(!regex_outcome) {
     	//block each group with \0 so we can trivially read them with pointers >groups[i].rm_so
-    	for (i = 1; i <= numgroups; i++) {
+    	for (i = 1; i <= RDP_NUMGROUPS; i++) {
 			groups[i].rm_eo = '\0';
 		}
 
-		r->header.intent = parsePacketIntent(groups[1].rm_so);
+		r->header.intent = parsePacketIntent(&s[groups[1].rm_so]);
 		//if the packet's intent was invalid we drop it
 		if(r->header.intent == INV) {
 			return 0;
 		}
 
 		//TODO: Error checking for values outside 2^32? 
-		r->header.seqno = (uint32_t) atoi(groups[2].rm_so);
-		r->header.ackno = (uint32_t) atoi(groups[3].rm_so);
-		r->header.datlen = (uint32_t) atoi(groups[4].rm_so);
-		r->header.winlen = (uint32_t) atoi(groups[5].rm_so);
+		r->header.seqno = (uint32_t) atoi(&s[groups[2].rm_so]);
+		r->header.ackno = (uint32_t) atoi(&s[groups[3].rm_so]);
+		r->header.datlen = (uint32_t) atoi(&s[groups[4].rm_so]);
+		r->header.winlen = (uint32_t) atoi(&s[groups[5].rm_so]);
 
     	return 1;
     } else {
-    	//if the packet's header doesn't conform to our spec we drop it (either bad request or bits have been flipped)
+    	//if the packet's header doesn't conform to our spec we drop it (either badly formed request or bits have been flipped)
     	return 0;
     }
 }
@@ -103,5 +110,5 @@ void * verifyMemory(void * p) {
 //A function to uniformly handly error messages
 //TODO: modularity + functionality improvement
 void printError(char * s) {
-	fprintf(stderr, "ERROR : %s", s);
+	fprintf(stderr, "ERROR : %s\n", s);
 }
