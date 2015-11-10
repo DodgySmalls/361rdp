@@ -25,6 +25,7 @@
 #endif
 
 #include <regex.h>
+#include <stdarg.h>
 
 typedef enum {SYN, ACK, DAT, FIN, RST, INV} packet_intent;
 
@@ -41,6 +42,7 @@ typedef struct {RDP_header header;
 			   } RDP_packet;
 
 typedef struct {char * mem;
+				uint32_t memlen;
 				uint32_t next_byte;
 				uint32_t winlen;		//maximum buffer and windowsize is 2^32
 			   } byte_buffer;
@@ -49,11 +51,23 @@ typedef struct {char * mem;
 #define RDP_REGEX_LITERAL "^RDP361 \\([a-zA-Z][a-zA-Z][a-zA-Z]\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\)\n\n"
 #define RDP_NUMGROUPS 5 //const number of groups in the above regex, so we just define it manually rather than searching for it iteratively
 
+/********************************
+		P2 spec mandatory: 			    
+********************************/
+#define MAX_PACKET_LEN 1024
+//to ensure payload doesn't overflow to 4 digits (makes calculating total packet size simpler) <- all this stuff would be better if we could use packed data ...
+#define MAX_RDP_PAYLOAD 999
+
 void * verifyMemory(void *);
-void printError(char *);
-packet_intent parsePacketIntent(char *);
-int RDPLoadPacket(char * s, RDP_packet *);
 int growMemory(void **, int);
+
+void printError(char *);
+
+packet_intent parsePacketIntent(char *);
+void RDPWritePacket(RDP_packet *, char *, byte_buffer *);
+int RDPWritePacketHeader(RDP_packet *, char *);
+int RDPLoadPacket(char * s, RDP_packet *);
+
 
 //Accepts a string and matches it to the set of different packet_intents
 packet_intent parsePacketIntent(char * s) {
@@ -125,6 +139,84 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
     	//if the packet's header doesn't conform to our spec we drop it (either badly formed request or bits have been flipped)
     	return 0;
     }
+}
+
+//puts a new packet into the memory located at *r
+//If you specify this as a DATA packet, the function expects a data pointer to be appended
+uint32_t RDPGeneratePacket(RDP_packet * r, packet_intent pint, uint32_t seq, uint32_t ack, uint32_t datl, uint32_t winl, ...) {
+	memset(r, 0, sizeof(RDP_packet)); //zero old memory
+	r->header.intent = pint;
+	r->header.seqno = seq;
+	r->header.ackno = ack;
+	r->header.winlen = winl;
+
+	//Now we need to ensure that the payload + ASCII version of this header won't be longer than 1024
+	//unpacked structure zzz...
+	if(r->header.intent == DAT) {
+		if(datl > MAX_RDP_PAYLOAD) {
+			datl = MAX_RDP_PAYLOAD;
+		}
+		r->header.datlen = datl;
+
+		char scratchspace[100];
+		int ofst = RDPWritePacketHeader(r, &(scratchspace[0]));
+
+		if(r->header.datlen > MAX_PACKET_LEN - (uint32_t) ofst) {
+			r->header.datlen = MAX_PACKET_LEN - (uint32_t) ofst;
+		}
+	}
+
+	//ensure that we received a pointer to some data
+	if(r->header.intent == DAT) {
+		va_list vl;
+		va_start (vl, 1);
+		r.payload = va_arg(vl, char *);
+		va_end(vl);
+	} else {
+		r->payload = NULL;
+	}
+}
+
+//writes the contents of a given RDP packet into a block of memory (* s)
+//note that if r is not a data packet we can simply supply a null pointer
+void RDPWritePacket(RDP_packet * r, char * s, byte_buffer * b) {
+	char * payload = (s + RDPWritePacketHeader(r, s));
+
+	//read the payload from the buffer
+}
+
+//writes the header to a given string, returns the length of the header that it wrote
+int RDPWritePacketHeader(RDP_packet * r, char * s) {
+	char * ss = s;
+	*ss = "RDP361 ";
+	ss = ss + 7;
+	if(r->header.intent == DAT) {
+		*ss = "DAT ";
+	} else if(r->header.intent == SYN) {
+		*ss = "SYN ";
+	} else if(r->header.intent == ACK) {
+		*ss = "ACK ";
+	} else if(r->header.intent == FIN) {
+		*ss = "FIN ";
+	} else if(r->header.intent == RST) {
+		*ss = "RST ";
+	} else {
+		*ss = "INV ";
+	}
+	ss = ss + 4;
+	ss = ss + sprintf(ss, "&#37;u", r->header.seqno);
+	*ss = " ";
+	ss++;
+	ss = ss + sprintf(ss, "&#37;u", r->header.ackno);
+	*ss = " ";
+	ss++;
+	ss = ss + sprintf(ss, "&#37;u", r->header.datlen);
+	*ss = " ";
+	ss++;
+	ss = ss + sprintf(ss, "&#37;u", r->header.winlen);
+	*ss = "\n\n\0";
+	ss = ss + 2;
+	return (int) ss - s;
 }
 
 //doubles up the memory allocated by a given pointer
