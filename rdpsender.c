@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #endif
 
 //inet libs
@@ -25,35 +26,87 @@
 //functions used across client/server
 #include "rdputil.c"
 
+
 //at most 10 outgoing packets at once
 #define OUT_BUF_LEN 10240
 //number of packets we will remember, could be as low as 3
 #define IN_PACKET_NUM 5
 
+RDP_packet in_packets[IN_PACKET_NUM];	//this is where we store the packed version of incoming information we read from inbuffer (cyclical queue : FIFO)
+int next_in_packet;						//index of the next RDP_packet in in_packet to which we can write (cyclical)
+
+byte_buffer outbuffer;					//our buffer where we store payloads in sequence (the contents of the file we're trying to transmit)
+char * rw_block;						//temp block with which we can read/write data
+
+FILE * infile;
+long file_len;
+
+struct sockaddr_in sender_addr;
+struct sockaddr_in recvr_addr;
+socklen_t recvr_addr_len;
+int sockfd;
+fd_set fds;
+int read_len;
+
+uint32_t rnd_num;
+
+//clean way to send a unique packet for this line of code
+void sendNewPacket(packet_intent pint, uint32_t s, uint32_t a, uint32_t d, uint32_t w, char * p) {
+	RDP_packet outpacket;
+	RDPGeneratePacket(&outpacket, pint, s, a, d, w, p);
+	RDPWritePacket(rw_block, &outpacket, NULL);
+	printf("SENDING : %s\n", rw_block);
+	if(sendto(sockfd, rw_block, strlen(rw_block), 0, (struct sockaddr *)&recvr_addr, recvr_addr_len) == -1) {
+		perror("ERROR : sendto()");
+		exit(172);
+	} 
+}
+
+//clean way to send a packet we had already generated somewhere else
+void sendParticularPacket(RDP_packet * r) {
+	RDPWritePacket(rw_block, r, NULL);
+	if(sendto(sockfd, rw_block, strlen(rw_block), 0, (struct sockaddr *)&recvr_addr, recvr_addr_len) == -1) {
+		perror("ERROR : sendto()");
+		exit(173);
+	}
+}
+
+/* NOTE that if something goes wrong (interally) we currently don't exit gracefully */
+long readPacket(RDP_packet * r) {
+	long rl;
+	if((rl = recvfrom(sockfd, rw_block, MAX_PACKET_LEN, 0, (struct sockaddr *)&recvr_addr, &recvr_addr_len)) == -1) {
+    	perror("recvfrom()");
+        exit(104);
+    } else {
+    	printf("RECEIVED : packet of length %ld\n", rl);
+    	memset(r, 0, sizeof(RDP_packet));
+        rw_block[rl] = '\0';
+        printf("LOADING : %s\n", rw_block);
+        if(RDPLoadPacket(rw_block, r) == 0) {
+        	printf("regex failed\n");
+        }
+    	return rl;
+    } 
+}
+
+void selectOnSockfd() {
+	FD_ZERO(&fds);
+    FD_SET(sockfd, &fds);
+    if(select(sockfd+1, &fds, NULL, NULL, NULL) == -1){
+        perror("ERROR : select()");
+        exit(110);
+    }
+}
+
 int main(int argc, char ** argv) {
 
-	RDP_packet in_packets[IN_PACKET_NUM];	//this is where we store the packed version of incoming information we read from inbuffer (cyclical queue : FIFO)
-	int next_in_packet;						//index of the next RDP_packet in in_packet to which we can write (cyclical)
-
-	byte_buffer outbuffer;					//our buffer where we store payloads in sequence (the contents of the file we're trying to transmit)
-	char * rw_block;						//temp block with which we can read/write data
-	int rw_block_len; 
-
-	FILE * infile;
-	long file_len;
-
-	struct sockaddr_in sender_addr;
-	struct sockaddir_in recvr_addr;
-	socklen_t recvr_addr_len;
-	int sockfd;
 
 	/********************************/						
 	/*         *  INIT 	*           */						
 
 	outbuffer.mem = (char *) verifyMemory(malloc(OUT_BUF_LEN * sizeof(char)));
 	outbuffer.memlen = OUT_BUF_LEN;
-	rw_block = (char *) verifyMemory(malloc((MAX_PACKET_LEN + 1)* sizeof(char)));
-	rw_block_len = (MAX_PACKET_LEN + 1);											//1 extra byte for \0 char
+	rw_block = (char *) verifyMemory(malloc((MAX_PACKET_LEN + 1)* sizeof(char)));		//1 extra byte for \0 char
 
 	if(argc != 6) { 
 		printError("Invalid invocation, expected: \"rdps <sender_ip> <sender_port> <receiver_ip> <receiver_port> <sender_file_name>\"");
@@ -61,9 +114,10 @@ int main(int argc, char ** argv) {
 	} 
 
 	//verify the file exists
-	infile = fopen(argv[5]);
+	infile = fopen(argv[5], "r");
 	if(infile == NULL) {
 		fprintf(stderr, "ERROR : Could not open file \"%s\"", argv[5]);
+		return 142;
 	} else {
 		//store the length of the file
 		fseek(infile, 0, SEEK_END);          
@@ -80,7 +134,7 @@ int main(int argc, char ** argv) {
     recvr_addr.sin_family = AF_INET; 
     recvr_addr.sin_addr.s_addr = inet_addr(argv[3]); 
     recvr_addr.sin_port = htons(atoi(argv[4]));
-    recvr_addr_len = sizeof(receiver_addr);
+    recvr_addr_len = sizeof(recvr_addr);
 
     //get a IPv4 datagram socket without predefined protocol
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1){
@@ -93,15 +147,52 @@ int main(int argc, char ** argv) {
         close(sockfd);
         return 102;
     } else if (bind(sockfd, (struct sockaddr *) &sender_addr, sizeof(struct sockaddr_in)) < 0){ 
-        close(sockfd);
         perror("ERROR : bind()");
+        close(sockfd);
         return 103;
     }
 
+
+    srand(time(NULL));
+    rnd_num = (uint32_t)rand();
+    rnd_num = rnd_num % 1000; //prep our random base sequence number between 1-1000
+    printf("I picked the random number: %"PRIu32"\n", rnd_num);
+    printf("I am %s\n", inet_ntoa(sender_addr.sin_addr));
+    printf("sending to: %s\n", inet_ntoa(recvr_addr.sin_addr));
+
 	//INITIATE the handshake with the given receiver (argv)
-	for(;;){
-		break;
+    sendNewPacket(SYN, rnd_num, 0, 0, 0, NULL);
+
+    for(;;) {
+		selectOnSockfd();
+        if(FD_ISSET(sockfd, &fds)){
+        	printf("there was data on socket\n");
+        	read_len = readPacket(&(in_packets[0]));
+        	if(in_packets[0].header.intent == ACK && in_packets[0].header.ackno == rnd_num) {
+        		//we're good to send data now!
+        		printf("we are happy campers\n");
+        		break;
+        	} else {
+        		printPacket(&(in_packets[0]));
+        		printf("something bad");
+        		break;
+        	}
+        }
+		//TODO timeout check;			
 	}
+
+
+	/*for(;;){
+		//send packet
+		
+		printf("TT");
+
+		//wait for response (proceed) or timeout (send another SYN)
+		f
+
+		//note that current controlflow doesn't work (always breaks completely once second loop breaks, should reloop 1 if timeout occurs)
+		break;
+	}*/
 
 	//transfer the file
 	for(;;){
@@ -115,7 +206,7 @@ int main(int argc, char ** argv) {
 
 	//send a fin and wait for an ACK
 	for(;;){
-	
+		break;
 	}
 
 	/*
@@ -137,6 +228,6 @@ int main(int argc, char ** argv) {
 	}
 	*/
 
-
+	close(sockfd);
     return 0;
 }

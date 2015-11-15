@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #endif
 
 //inet libs
@@ -47,7 +48,7 @@ typedef struct {char * mem;
 				uint32_t winlen;		//maximum buffer and windowsize is 2^32
 			   } byte_buffer;
 
-//                           magic      _type_             _seqno_      _ackno_     _datalen_    _windowlen_
+//                           magic      _type_                       _seqno_      _ackno_     _datalen_    _windowlen_
 #define RDP_REGEX_LITERAL "^RDP361 \\([a-zA-Z][a-zA-Z][a-zA-Z]\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\) \\([0-9]*\\)\n\n"
 #define RDP_NUMGROUPS 5 //const number of groups in the above regex, so we just define it manually rather than searching for it iteratively
 
@@ -64,9 +65,9 @@ int growMemory(void **, int);
 void printError(char *);
 
 packet_intent parsePacketIntent(char *);
-void RDPWritePacket(RDP_packet *, char *, byte_buffer *);
-int RDPWritePacketHeader(RDP_packet *, char *);
-int RDPLoadPacket(char * s, RDP_packet *);
+void RDPWritePacket(char *, RDP_packet *, byte_buffer *);
+int RDPWritePacketHeader(char *, RDP_packet *);
+int RDPLoadPacket(char *, RDP_packet *);
 
 
 //Accepts a string and matches it to the set of different packet_intents
@@ -97,7 +98,7 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
 	regex_t RDP_regex;
 	regmatch_t groups[10]; //const size is fine because # of matched groups doesn't grow
 
-	uint8_t * pdat;
+	char * pdat;
 
 	//we zero the packet to ensure that if the match fails no garbage data remains
 	memset(r, 0, sizeof(RDP_packet));
@@ -107,6 +108,7 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
 	}
 
 	regex_outcome = regexec(&RDP_regex, s, RDP_regex.re_nsub+1, groups, 0);
+	printf("trying to match \"%s\"", s);
     if(!regex_outcome) {
     	//block each group with \0 so we can trivially read them with pointers >groups[i].rm_so
     	for (i = 1; i <= RDP_NUMGROUPS; i++) {
@@ -126,13 +128,13 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
 		r->header.winlen = (uint32_t) atoi(&s[groups[5].rm_so]);
 
 		//expressions are matched IFF 000\n\n is present, ' datlen ' bytes after are considered data.
-		pdat = (uint8_t *) &(s[groups[5].rm_eo+2]);
+		pdat = (char *) &(s[groups[5].rm_eo+2]);
 
 		//right now ' pdat ' points to memory we will want to re-use for other packets (a buffer), so we malloc new memory to store the payload
 		//' datlen ' is bytesize, but we need one extra byte for the string end character
-		r->payload = (uint8_t *) verifyMemory(malloc(r->header.datlen + 1)); 
+		r->payload = (char *) verifyMemory(malloc(r->header.datlen + 1)); 
 		memmove(r->payload, pdat, r->header.datlen);
-		r->payload[r->header.datlen] = (uint8_t) '\0';
+		r->payload[r->header.datlen] ='\0';
 
     	return 1;
     } else {
@@ -142,8 +144,7 @@ int RDPLoadPacket(char * s, RDP_packet * r) {
 }
 
 //puts a new packet into the memory located at *r
-//If you specify this as a DATA packet, the function expects a data pointer to be appended
-uint32_t RDPGeneratePacket(RDP_packet * r, packet_intent pint, uint32_t seq, uint32_t ack, uint32_t datl, uint32_t winl, ...) {
+uint32_t RDPGeneratePacket(RDP_packet * r, packet_intent pint, uint32_t seq, uint32_t ack, uint32_t datl, uint32_t winl, char * p) {
 	memset(r, 0, sizeof(RDP_packet)); //zero old memory
 	r->header.intent = pint;
 	r->header.seqno = seq;
@@ -159,64 +160,49 @@ uint32_t RDPGeneratePacket(RDP_packet * r, packet_intent pint, uint32_t seq, uin
 		r->header.datlen = datl;
 
 		char scratchspace[100];
-		int ofst = RDPWritePacketHeader(r, &(scratchspace[0]));
+		int ofst = RDPWritePacketHeader(&(scratchspace[0]), r);
 
 		if(r->header.datlen > MAX_PACKET_LEN - (uint32_t) ofst) {
 			r->header.datlen = MAX_PACKET_LEN - (uint32_t) ofst;
 		}
 	}
+	
+	r->payload = p;
 
-	//ensure that we received a pointer to some data
-	if(r->header.intent == DAT) {
-		va_list vl;
-		va_start (vl, 1);
-		r.payload = va_arg(vl, char *);
-		va_end(vl);
-	} else {
-		r->payload = NULL;
-	}
+	return r->header.datlen;
 }
 
 //writes the contents of a given RDP packet into a block of memory (* s)
 //note that if r is not a data packet we can simply supply a null pointer
-void RDPWritePacket(RDP_packet * r, char * s, byte_buffer * b) {
-	char * payload = (s + RDPWritePacketHeader(r, s));
+void RDPWritePacket(char * s, RDP_packet * r, byte_buffer * b) {
+	char * payload = (s + RDPWritePacketHeader(s, r));
 
 	//read the payload from the buffer
 }
 
 //writes the header to a given string, returns the length of the header that it wrote
-int RDPWritePacketHeader(RDP_packet * r, char * s) {
+int RDPWritePacketHeader(char * s, RDP_packet * r) {
 	char * ss = s;
-	*ss = "RDP361 ";
-	ss = ss + 7;
+	ss = ss + sprintf(ss, "RDP361 ");
 	if(r->header.intent == DAT) {
-		*ss = "DAT ";
+		ss = ss + sprintf(ss, "DAT ");
 	} else if(r->header.intent == SYN) {
-		*ss = "SYN ";
+		ss = ss + sprintf(ss, "SYN ");
 	} else if(r->header.intent == ACK) {
-		*ss = "ACK ";
+		ss = ss + sprintf(ss, "ACK ");
 	} else if(r->header.intent == FIN) {
-		*ss = "FIN ";
+		ss = ss + sprintf(ss, "FIN ");
 	} else if(r->header.intent == RST) {
-		*ss = "RST ";
+		ss = ss + sprintf(ss, "RST ");
 	} else {
-		*ss = "INV ";
+		ss = ss + sprintf(ss, "INV ");
 	}
-	ss = ss + 4;
-	ss = ss + sprintf(ss, "&#37;u", r->header.seqno);
-	*ss = " ";
-	ss++;
-	ss = ss + sprintf(ss, "&#37;u", r->header.ackno);
-	*ss = " ";
-	ss++;
-	ss = ss + sprintf(ss, "&#37;u", r->header.datlen);
-	*ss = " ";
-	ss++;
-	ss = ss + sprintf(ss, "&#37;u", r->header.winlen);
-	*ss = "\n\n\0";
-	ss = ss + 2;
-	return (int) ss - s;
+	ss = ss + sprintf(ss, "%"PRIu32" ", r->header.seqno);
+	ss = ss + sprintf(ss, "%"PRIu32" ", r->header.ackno);
+	ss = ss + sprintf(ss, "%"PRIu32" ", r->header.datlen);
+	ss = ss + sprintf(ss, "%"PRIu32"", r->header.winlen);
+	ss = ss + sprintf(ss, "\n\n");
+	return (int) (ss - s);
 }
 
 //doubles up the memory allocated by a given pointer
@@ -244,4 +230,8 @@ void * verifyMemory(void * p) {
 //TODO: modularity + functionality improvement
 void printError(char * s) {
 	fprintf(stderr, "ERROR : %s\n", s);
+}
+
+void printPacket(RDP_packet * r){
+	printf("PACKET : SEQ:%"PRIu32" - ACK:%"PRIu32" - DATALENGTH:%"PRIu32" - WINDOWLENGTH:%"PRIu32" \n", r->header.seqno, r->header.ackno, r->header.datlen, r->header.winlen);
 }
