@@ -26,20 +26,18 @@
 //functions used across client/server
 #include "rdputil.c"
 
-
-//at most 10 outgoing packets at once
-#define OUT_BUF_LEN 10240
-//number of packets we will remember, could be as low as 3
-#define IN_PACKET_NUM 5
+#define OUT_BUF_LEN 10240    //at most 10 outgoing packets at once
+#define IN_PACKET_NUM 5      //number of packets we will remember, could be as low as 3
 
 RDP_packet in_packets[IN_PACKET_NUM];	//this is where we store the packed version of incoming information we read from inbuffer (cyclical queue : FIFO)
 int next_in_packet;						//index of the next RDP_packet in in_packet to which we can write (cyclical)
 
-byte_buffer outbuffer;					//our buffer where we store payloads in sequence (the contents of the file we're trying to transmit)
+bytebuffer32_t outbuffer;				//our buffer where we store payloads in sequence (the contents of the file we're trying to transmit)
 char * rw_block;						//temp block with which we can read/write data
 
 FILE * infile;
 long file_len;
+long file_read_head;
 
 struct sockaddr_in sender_addr;
 struct sockaddr_in recvr_addr;
@@ -48,27 +46,35 @@ int sockfd;
 fd_set fds;
 int read_len;
 
-uint32_t rnd_num;
+uint32_t client_request;
+double timeoutdur;
+
+time_t last_response;
+time_t last_packetout;
+time_t current_time;
+
+RDP_state current_state;
+
+struct timeval select_timeout = {1, 0}; // 1seconds
 
 //clean way to send a unique packet for this line of code
-void sendNewPacket(packet_intent pint, uint32_t s, uint32_t a, uint32_t d, uint32_t w, char * p) {
+void sendNewPacket(packet_intent pint, uint32_t s, uint32_t a, uint32_t d, uint32_t w) {
+	//track whenever we sent a packet out last
+	time(&last_packetout);
+
 	RDP_packet outpacket;
-	RDPGeneratePacket(&outpacket, pint, s, a, d, w, p);
-	RDPWritePacket(rw_block, &outpacket, NULL);
-	printf("SENDING : %s\n", rw_block);
+	//don't read past the end of the file
+	if(s + d > file_len - file_read_head) {
+		d = file_len - client_request;
+	}
+	RDPGeneratePacket(&outpacket, pint, s, a, d, w);
+	RDPWritePacket(rw_block, &outpacket, &outbuffer);
+	printf("SENDING: ");
+    printPacket(&outpacket);
 	if(sendto(sockfd, rw_block, strlen(rw_block), 0, (struct sockaddr *)&recvr_addr, recvr_addr_len) == -1) {
 		perror("ERROR : sendto()");
 		exit(172);
 	} 
-}
-
-//clean way to send a packet we had already generated somewhere else
-void sendParticularPacket(RDP_packet * r) {
-	RDPWritePacket(rw_block, r, NULL);
-	if(sendto(sockfd, rw_block, strlen(rw_block), 0, (struct sockaddr *)&recvr_addr, recvr_addr_len) == -1) {
-		perror("ERROR : sendto()");
-		exit(173);
-	}
 }
 
 /* NOTE that if something goes wrong (interally) we currently don't exit gracefully */
@@ -78,13 +84,13 @@ long readPacket(RDP_packet * r) {
     	perror("recvfrom()");
         exit(104);
     } else {
-    	printf("RECEIVED : packet of length %ld\n", rl);
     	memset(r, 0, sizeof(RDP_packet));
         rw_block[rl] = '\0';
-        printf("LOADING : %s\n", rw_block);
-        if(RDPLoadPacket(rw_block, r) == 0) {
-        	printf("regex failed\n");
-        }
+        if(RDPLoadPacket(rw_block, r) == NULL) {
+       		printf("regex failed");
+       	}
+       	printf("RECEIVED: ");
+        printPacket(r);
     	return rl;
     } 
 }
@@ -92,17 +98,13 @@ long readPacket(RDP_packet * r) {
 void selectOnSockfd() {
 	FD_ZERO(&fds);
     FD_SET(sockfd, &fds);
-    if(select(sockfd+1, &fds, NULL, NULL, NULL) == -1){
+    if(select(sockfd+1, &fds, NULL, NULL, &select_timeout) == -1){
         perror("ERROR : select()");
         exit(110);
     }
 }
 
-int main(int argc, char ** argv) {
-
-
-	/********************************/						
-	/*         *  INIT 	*           */						
+int main(int argc, char ** argv) {				
 
 	outbuffer.mem = (char *) verifyMemory(malloc(OUT_BUF_LEN * sizeof(char)));
 	outbuffer.memlen = OUT_BUF_LEN;
@@ -123,6 +125,7 @@ int main(int argc, char ** argv) {
 		fseek(infile, 0, SEEK_END);          
 		file_len = ftell(infile);             
 		rewind(infile); 
+		printf("file len: %ld\n", file_len);
 	}
 
     memset(&sender_addr, 0, sizeof(struct sockaddr_in)); //zero garbage memory
@@ -152,82 +155,141 @@ int main(int argc, char ** argv) {
         return 103;
     }
 
+    //fill the buffer
+    if(file_len > outbuffer.memlen) {
+    	fread((void*)outbuffer.mem,1,outbuffer.memlen,infile);
+    	file_read_head = outbuffer.memlen;
+    } else {
+    	fread((void*)outbuffer.mem,1,file_len,infile);
+    	file_read_head = file_len;						
+    }
+    //the buffer's initial configuration is that buffer = window (same position and size)
+    outbuffer.win = outbuffer.mem;
+    outbuffer.winlen = outbuffer.memlen;
+    //currently the window points to the first byte of the file
+    outbuffer.win_seqno = 0;		
 
-    srand(time(NULL));
+    /*srand(time(NULL));
     rnd_num = (uint32_t)rand();
     rnd_num = rnd_num % 1000; //prep our random base sequence number between 1-1000
-    printf("I picked the random number: %"PRIu32"\n", rnd_num);
+    printf("I picked the random number: %"PRIu32"\n", rnd_num); */
     printf("I am %s\n", inet_ntoa(sender_addr.sin_addr));
     printf("sending to: %s\n", inet_ntoa(recvr_addr.sin_addr));
+ 
+    timeoutdur = 3.00;
+    time(&last_response);
+    time(&last_packetout);
 
-	//INITIATE the handshake with the given receiver (argv)
-    sendNewPacket(SYN, rnd_num, 0, 0, 0, NULL);
-
+    current_state = HANDSHAKE;
     for(;;) {
-		selectOnSockfd();
-        if(FD_ISSET(sockfd, &fds)){
-        	printf("there was data on socket\n");
-        	read_len = readPacket(&(in_packets[0]));
-        	if(in_packets[0].header.intent == ACK && in_packets[0].header.ackno == rnd_num) {
-        		//we're good to send data now!
-        		printf("we are happy campers\n");
-        		break;
-        	} else {
-        		printPacket(&(in_packets[0]));
-        		printf("something bad");
-        		break;
-        	}
-        }
-		//TODO timeout check;			
-	}
 
+	    if(current_state == HANDSHAKE) {
+		    for(;;) {
+		    	sendNewPacket(SYN, 0, 0, 0, 0);
 
-	/*for(;;){
-		//send packet
-		
-		printf("TT");
+				selectOnSockfd();
+		        if(FD_ISSET(sockfd, &fds)){
+		        	printf("there was data on socket\n");
+		        	read_len = readPacket(&(in_packets[0]));
+		        	if(in_packets[0].intent == ACK && in_packets[0].ackno == 0) {
+		        		printf("going to data transfer\n");
+		        		client_request = 0;        		
+		        		time(&last_response);
+		        		current_state = TRANSFER;
+		        		break;
+		        	} else if (in_packets[0].intent == RST) {
+		        		sendNewPacket(SYN, 0, 0, 0, 0);
+		        	}
+		        } else {
+					time(&current_time);
+					if(difftime(current_time, last_packetout) > timeoutdur && difftime(current_time, last_response) > timeoutdur) {
+						sendNewPacket(SYN, 0, 0, 0, 0);
+					}
+				}			
+			}
+		}//HANDSHAKE
 
-		//wait for response (proceed) or timeout (send another SYN)
-		f
+		if(current_state == TRANSFER) {
+			int count = 1;	//temp
+			if(file_len < MAX_RDP_PAYLOAD) {
+				sendNewPacket(DAT, 0, 1, file_len, MAX_PACKET_LEN);
+			} else {
+				sendNewPacket(DAT, 0, 1, MAX_PACKET_LEN, MAX_PACKET_LEN);
+			}
+			
+			client_request = 0;
 
-		//note that current controlflow doesn't work (always breaks completely once second loop breaks, should reloop 1 if timeout occurs)
-		break;
-	}*/
+			for(;;){
+				selectOnSockfd();
+				if(FD_ISSET(sockfd, &fds)){
+					read_len = readPacket(&(in_packets[0]));
 
-	//transfer the file
-	for(;;){
-		if(1/*data on socket*/) {
-			//read data
-			//act on that data
-		} 
-			//timeout?
-		break;		//condition is that you receive an ACK for the end of the file
-	}
+					if(read_len > 0) {	//if the packet was accepted
+						client_request = in_packets[0].ackno;
+						time(&last_response);
+					}
 
-	//send a fin and wait for an ACK
-	for(;;){
-		break;
-	}
+					//if the client acked past the beginning of our buffer we know we can shrink the window
+					if(client_request > outbuffer.win_seqno) {
+						uint32_t dif = client_request - outbuffer.win_seqno;
+						outbuffer.win += dif;
+						outbuffer.win_seqno += dif;
+						outbuffer.winlen -= dif;
 
-	/*
-	strncpy(outbuffer, "RDP361 DAT 0 1 2 3\n\nQQQ", IN_INIT_BUF_LEN);
-	strncpy(inbuffer, "qwerty", IN_INIT_BUF_LEN);
-	memmove(inbuffer, outbuffer, IN_INIT_BUF_LEN);
-	printf("(%d) out: %s\nin: %s\n", outbuffer_size, outbuffer, inbuffer);
+						if(outbuffer.win > outbuffer.mem + outbuffer.memlen) {
+							outbuffer.win -= outbuffer.memlen;
+						}
+					}
 
-	if(!RDPLoadPacket(inbuffer, &in_packet)) {
-		printError("rdpserver : packet was rejected");
-	} else {
-		if(in_packet.header.intent == DAT) {
-			printf("Header: DAT ");
-		} else {
-			printf("Header: something that isn't DAT ");
+					printf("client requested byte: %"PRIu32" -\n", client_request);
+					if(client_request >= file_len) {
+						current_state = FINISHED;
+						break;				//break makes the loop condition redundant
+					} else {
+						//note that what we report our window size as MAX_PACKET_LEN (size of our rw_block), since the sender's window isn't significant
+						// "transmit a DAT packet with as much data as we can beginning from the byte the client last requested"
+						sendNewPacket(DAT, client_request, 1, MAX_PACKET_LEN, MAX_PACKET_LEN);
+					}
+				} else {
+
+					time(&current_time);
+					//wait until no communication has been received between the two hosts for duration timeoutdur
+					if(difftime(current_time, last_packetout) > timeoutdur && difftime(current_time, last_packetout) > timeoutdur) {
+						sendNewPacket(DAT, outbuffer.win_seqno, 1, MAX_PACKET_LEN, MAX_PACKET_LEN);
+					} else {
+						file_read_head += bytebuffer32_ExpandFromFile(&outbuffer, infile, file_len - file_read_head);
+					}
+				}
+			}
+		}//TRANSFER
+
+		if(current_state == FINISHED){
+			
+			sendNewPacket(FIN,0,0,0,0);
+
+			for(;;) {
+				selectOnSockfd();
+		        if(FD_ISSET(sockfd, &fds)){
+		        	read_len = readPacket(&(in_packets[0]));
+		        	if(in_packets[0].intent == ACK && in_packets[0].seqno == 2) {
+		        		current_state = COMPLETE;
+		        		break;
+		        	}
+		        } else {
+		        	time(&current_time);
+		        	if(difftime(current_time, last_packetout) > timeoutdur && difftime(current_time, last_packetout) > timeoutdur) {
+		        		sendNewPacket(FIN,0,0,0,0);
+		        	}
+		        }
+		    }
+		}//FIN
+
+		if(current_state == COMPLETE){
+			break;
 		}
-		printf("%"PRIu32" %"PRIu32" %"PRIu32" %"PRIu32" \n", in_packet.header.seqno, in_packet.header.ackno, in_packet.header.datlen, in_packet.header.winlen);
-		printf("DATA (%"PRIu32") bytes: %s\n", in_packet.header.datlen, in_packet.payload);
 	}
-	*/
 
+	fclose(infile);
 	close(sockfd);
     return 0;
 }
