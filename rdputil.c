@@ -33,6 +33,7 @@
 #define RDP_NUMGROUPS 5 //const number of groups in the above regex, so we just define it manually rather than searching for it iteratively
 #define MAX_PACKET_LEN 1024	//defined by p2 spec
 #define MAX_RDP_PAYLOAD 999	//ensure datalength doesn't overflow to 4 digits. Unpacked structure zzz...
+#define MAX_LIMBO_PACKETS 10
 
 typedef enum {SYN, ACK, DAT, FIN, RST, INV} packet_intent;
 
@@ -43,6 +44,7 @@ typedef struct {packet_intent intent;
 				uint32_t ackno;
 				uint32_t datlen; 
 				uint32_t winlen;
+				time_t departure;
 			   } RDP_packet;
 
 typedef struct { 

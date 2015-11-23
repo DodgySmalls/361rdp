@@ -26,14 +26,11 @@
 //functions used across client/server
 #include "rdputil.c"
 
-//initially we will account for 10 incoming packets at once that we remember, if more are needed (very unlikely to happen) then we will grow our memory
-#define INIT_NUM_TRACKED_PACKETS 10
 #define IN_BUF_LEN 10240
     
 //using global variables to make the code more concise
-RDP_packet in_packets[INIT_NUM_TRACKED_PACKETS];    //this is where we store the packed version of incoming information we read from inbuffer (cyclical queue : FIFO)
-int next_in_packet;                     //index of the next RDP_packet in in_packet to which we can write (cyclical)
-int in_packets_len;                     //current number of packets we're tracking  <- this is a byproduct of using a header which is not packed
+RDP_packet in_packets[MAX_LIMBO_PACKETS];    //this is where we store the packed version of incoming information we read from inbuffer (cyclical queue : FIFO)
+int num_in_packets;
 
 bytebuffer32_t inbuffer;                   //our buffer where we store packet payloads in sequence (the contents of the file we're trying to receive)
 char * rw_block;                        //temp block with which we can read/write data  
@@ -54,7 +51,7 @@ double timeoutdur;
 
 RDP_state current_state;
 
-struct timeval select_timeout = {1, 0}; // 1seconds
+struct timeval select_timeout = {0, 2500}; // 1seconds
 
 //clean way to send a unique packet for this line of code
 void sendNewPacket(packet_intent pint, uint32_t s, uint32_t a, uint32_t d, uint32_t w) {
@@ -100,6 +97,7 @@ long readPacket(RDP_packet * r) {
         } else if (r->datlen > 0) {
             //printf(payload);
             bytebuffer32_WriteTo(payload, &inbuffer, r->seqno, r->datlen);
+
         }
 
         printf("RECEIVED: ");
@@ -118,11 +116,6 @@ void selectOnSockfd() {
 }
 
 int main(int argc, char ** argv) {
-    /********************************/                      
-    /*         *  INIT  *           */
-
-    in_packets_len = INIT_NUM_TRACKED_PACKETS;
-    next_in_packet = 0;
 
     inbuffer.mem = (char *) verifyMemory(malloc(IN_BUF_LEN * sizeof(char)));
     inbuffer.memlen = IN_BUF_LEN;
@@ -169,6 +162,8 @@ int main(int argc, char ** argv) {
 
     printf("I am identified as: %s before NAT\n", inet_ntoa(recvr_addr.sin_addr));
 
+    printf("NEW\n");
+
     inbuffer.win = inbuffer.mem;
     inbuffer.winlen = inbuffer.memlen;
     inbuffer.win_seqno = 0;
@@ -185,47 +180,67 @@ int main(int argc, char ** argv) {
                     read_len = readPacket(&(in_packets[0]));
             
                     if(in_packets[0].intent == SYN) {
-                        //printf("Received random number: %"PRIu32"\n", rnd_num);
-                        printf("I am still %s\n", inet_ntoa(recvr_addr.sin_addr));
-                        printf("sender is: %s\n", inet_ntoa(sender_addr.sin_addr));
-                        //put a new ACK + SYN packet into rw_block and send it back
-                        sendNewPacket(ACK, 1, 0, 0, IN_BUF_LEN);
-                    } else if (in_packets[0].intent == DAT) {
+                        sendNewPacket(ACK, 1, 0, 0, inbuffer.winlen);
                         current_state = TRANSFER;
                         break;
                     } else {
                         //try to RST connection (packet was malformed or damaged during transmission)
                         printf("RST");
-                        sendNewPacket(RST, 0, 0, 0, IN_BUF_LEN);
+                        sendNewPacket(RST, 0, 0, 0, inbuffer.winlen);
                     } 
                 }
             }//HANDSHAKE
         }
 
         if(current_state == TRANSFER) {
-            if(in_packets[0].intent == DAT) {
-                //handle extra packet we got in handshake state?
-            }
+            num_in_packets = 0;
 
             for(;;){
                 selectOnSockfd();
-                if(FD_ISSET(sockfd, &fds)){
-                    read_len = readPacket(&(in_packets[0]));    //reads the header into in_packets[0] and the payload into the inbuffer
+                if(inbuffer.winlen < MAX_PACKET_LEN){
+                    bytebuffer32_FlushToFile(&inbuffer, outfile);
+                } else if (FD_ISSET(sockfd, &fds)){
+                    read_len = readPacket(&(in_packets[num_in_packets]));    //reads the header into in_packets[0] and the payload into the inbuffer
 
-                    if(in_packets[0].intent == DAT) {
-                        sendNewPacket(ACK, 1, in_packets[0].seqno + in_packets[0].datlen, 0, inbuffer.winlen);
-                        
-                        uint32_t s = inbuffer.win_seqno;
-                        inbuffer.win_seqno = in_packets[0].seqno + in_packets[0].datlen;
-                        inbuffer.win += inbuffer.win_seqno - s;
-                        inbuffer.winlen -= inbuffer.win_seqno - s;
+                    if(in_packets[num_in_packets].intent == DAT && read_len > 0) {
+                        num_in_packets++;
+                        int i;
+                        int j;
+                        for(i=0;i<num_in_packets;i++){
+                            if(in_packets[i].seqno <= inbuffer.win_seqno && in_packets[i].seqno + in_packets[i].datlen > inbuffer.win_seqno) {
+                                uint32_t s = inbuffer.win_seqno;
+                                inbuffer.win_seqno = in_packets[i].seqno + in_packets[i].datlen;
+                                inbuffer.win += inbuffer.win_seqno - s;
+                                inbuffer.winlen -= inbuffer.win_seqno - s;
 
-                        if(inbuffer.win > inbuffer.mem + inbuffer.memlen) {
-                            inbuffer.win -= inbuffer.memlen;
+                                if(inbuffer.win > inbuffer.mem + inbuffer.memlen) {
+                                    inbuffer.win -= inbuffer.memlen;
+                                }
+
+                                for(j=i;j<num_in_packets-1;j++) {
+                                    memmove(&in_packets[j], &in_packets[j+1], sizeof(RDP_packet));
+                                }
+                                memset(&in_packets[j], 0, sizeof(RDP_packet));
+                                num_in_packets--;
+                                i=0;
+                            } else if(in_packets[i].seqno <= inbuffer.win_seqno && in_packets[i].seqno + in_packets[i].datlen < inbuffer.win_seqno) {
+                                for(j=i;j<num_in_packets-1;j++) {
+                                    memmove(&in_packets[j], &in_packets[j+1], sizeof(RDP_packet));
+                                }
+                                memset(&in_packets[j], 0, sizeof(RDP_packet));
+                                num_in_packets--;
+                                i=0;
+                            }
                         }
-                    } else if (in_packets[0].intent == FIN) {
+
+                        sendNewPacket(ACK, 1, inbuffer.win_seqno, 0, inbuffer.winlen);
+                    } else if (in_packets[num_in_packets].intent == FIN) {
                         sendNewPacket(ACK, 2, 0, 0, 0);
                         current_state = FINISHED;
+                        break;
+                    } else if (in_packets[num_in_packets].intent == ACK || in_packets[0].intent == RST) {
+                        sendNewPacket(ACK, 1, 0, 0, 0);
+                        current_state = TRANSFER;
                         break;
                     }
                 } else {
